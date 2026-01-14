@@ -1,0 +1,752 @@
+<#
+.SYNOPSIS
+  Generate an OKR HTML report from OBoard (optionally send via Microsoft Graph)
+
+.DESCRIPTION
+  - Fetches OBoard users, finds a user by email
+  - Fetches elements (OKRs/KRs) for that user + interval
+  - Builds hierarchy (parent/child) and calculates depth
+  - (Optional) Fetches latest comment for Objective (root) items only
+  - Renders an email-safe HTML table
+  - (Optional) Sends the report via Microsoft Graph sendMail
+
+.NOTES
+  Designed for Azure Automation Runbooks (PowerShell 7 recommended).
+
+.REQUIRED AUTOMATION VARIABLES
+  - API-Token        (OBoard token)
+  - baseurl         (your OBoard API base)
+  - UiBase         
+  - ApplicationClientID
+  - ApplicationTenantID
+  - ApplicationClientSecret
+  - SenderEmail      (UPN of mailbox/service account that will send mail via Graph)
+
+.EXAMPLE
+  .\Export-OKREmailReport.ps1 -UserEmail "john@example.com" -IntervalId 123 | Out-File report.html -Encoding utf8
+
+.EXAMPLE
+  .\Export-OKREmailReport.ps1 -UserEmail "john@example.com" -IntervalId 123 -SendEmail -Recipient "manager@example.com"
+#>
+
+[CmdletBinding()]
+param(
+  [Parameter(Mandatory=$false)]
+  [string]$UserEmail = "enter employee email address",
+
+  [Parameter(Mandatory=$false)]
+  [int]$IntervalId = "Enter here your interval id - can be reachable from oboard link",
+
+  [Parameter(Mandatory=$false)]
+  [int]$TruncateDescription = 200,
+
+  [Parameter(Mandatory=$false)]
+  [bool]$IncludeComments = $true,
+
+  [Parameter(Mandatory=$false)]
+  [switch]$SendEmail,
+
+  [Parameter(Mandatory=$false)]
+  [string]$Recipient = ""
+)
+
+# ----------------------------
+# Runbook-safe preferences
+# ----------------------------
+$VerbosePreference     = 'SilentlyContinue'
+$InformationPreference = 'SilentlyContinue'
+$ProgressPreference    = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+
+# UTF-8 defaults
+$PSDefaultParameterValues['Out-File:Encoding']    = 'utf8'
+$PSDefaultParameterValues['Export-Csv:Encoding']  = 'utf8'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# Load System.Web for HTML encode/decode
+Add-Type -AssemblyName System.Web
+
+# ----------------------------
+# Automation Variables
+# ----------------------------
+function Get-AutoVarSafe {
+  param([Parameter(Mandatory=$true)][string]$Name, [string]$Default = "")
+  try { return (Get-AutomationVariable -Name $Name) } catch { return $Default }
+}
+
+$ApiToken     = Get-AutoVarSafe -Name 'API-Token'
+$BaseUrl      = Get-AutoVarSafe -Name 'baseurl' -Default 'enter your base url link'
+$UiBase       = Get-AutoVarSafe -Name 'UiBase'  -Default ''   # optional deep link base
+
+$clientId     = Get-AutoVarSafe -Name "ApplicationClientID"
+$tenantId     = Get-AutoVarSafe -Name "ApplicationTenantID"
+$clientSecret = Get-AutoVarSafe -Name "ApplicationClientSecret"
+$senderEmail  = Get-AutoVarSafe -Name "SenderEmail"
+
+if ([string]::IsNullOrWhiteSpace($ApiToken)) { throw "Missing Automation Variable: API-Token" }
+if ([string]::IsNullOrWhiteSpace($BaseUrl))  { throw "Missing Automation Variable: baseurl" }
+
+# If sending email and Recipient not provided, default to the report UserEmail
+if ($SendEmail -and [string]::IsNullOrWhiteSpace($Recipient)) { $Recipient = $UserEmail }
+if ($SendEmail -and [string]::IsNullOrWhiteSpace($senderEmail)) { throw "Missing Automation Variable: SenderEmail" }
+
+# ----------------------------
+# Text cleanup (NO '??' hacks)
+# ----------------------------
+function Clean-OBoardText {
+  param(
+    [Parameter(Mandatory=$false)][string]$Text,
+    [Parameter(Mandatory=$false)][int]$MaxLength = 0,
+    [Parameter(Mandatory=$false)][switch]$ForHtml
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+
+  # 1) Decode HTML entities coming from API
+  $t = [System.Web.HttpUtility]::HtmlDecode([string]$Text)
+
+  # 2) Normalize line breaks
+  $t = $t -replace "`r`n", "`n"
+  $t = $t -replace "`r", "`n"
+
+  # 3) Strip tags (defensive)
+  $t = $t -replace '<[^>]+>', ''
+
+  # 4) Normalize NBSP and trim
+  $t = $t -replace [char]0x00A0, ' '
+  $t = $t.Trim()
+
+  # 4.2) Remove invisible/broken unicode that Outlook renders as "?"
+  $t = $t -replace [char]0xFFFD, ''                 # replacement char
+  $t = $t -replace '[\u200B\u200C\u200D\uFEFF]', ''  # zero-width + BOM
+
+ # 4.3) Remove question mark emoji unicode
+  $t = $t -replace '\u2753 \uFE0F', ''
+  $t = $t -replace '❓', ''
+
+  # Remove other control chars except tab/newline
+  $t = ($t.ToCharArray() | Where-Object {
+      ($_ -eq "`n") -or ($_ -eq "`t") -or ([int]$_ -ge 32)
+  }) -join ''
+
+  # 5) Truncate (optional)
+  if ($MaxLength -gt 0 -and $t.Length -gt $MaxLength) {
+    $cut = $t.Substring(0, $MaxLength)
+    $cut = $cut -replace '\s+\S*$',''
+    if ([string]::IsNullOrWhiteSpace($cut)) { $cut = $t.Substring(0, $MaxLength) }
+    $t = $cut.Trim() + "…"
+  }
+
+  if ($ForHtml) { return [System.Web.HttpUtility]::HtmlEncode($t) }
+  return $t
+}
+
+
+# ----------------------------
+# OBoard API
+# ----------------------------
+function Invoke-OboardAPIRequest {
+  [CmdletBinding()]
+  param(
+    [Parameter(Mandatory=$true)][string]$BaseUrl,
+    [Parameter(Mandatory=$true)][string]$ApiToken,
+    [Parameter(Mandatory=$true)][string]$Method,
+    [Parameter(Mandatory=$true)][string]$Endpoint,
+    [Parameter(Mandatory=$false)][hashtable]$QueryParams = @{},
+    [Parameter(Mandatory=$false)][object]$Body = $null
+  )
+
+  $url = "$($BaseUrl.TrimEnd('/'))$Endpoint"
+
+  if ($QueryParams.Count -gt 0) {
+    $queryString = ($QueryParams.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join '&'
+    $url = $url + "?$queryString"
+  }
+
+  $headers = @{
+    'API-Token'      = $ApiToken
+    'Accept'         = 'application/json'
+    'Content-Type'   = 'application/json; charset=utf-8'
+    'Accept-Charset' = 'utf-8'
+  }
+
+  $params = @{
+    Uri         = $url
+    Method      = $Method
+    Headers     = $headers
+    ContentType = 'application/json; charset=utf-8'
+  }
+
+  if ($Body) { $params['Body'] = ($Body | ConvertTo-Json -Depth 10) }
+
+  try {
+    $resp = Invoke-RestMethod @params
+    Start-Sleep -Milliseconds 200 # simple rate-limit guard
+    return $resp
+  }
+  catch {
+    throw "API request failed ($Method $Endpoint): $($_.Exception.Message)"
+  }
+}
+
+function Get-OboardUsers {
+  param([string]$BaseUrl,[string]$ApiToken)
+  Invoke-OboardAPIRequest -BaseUrl $BaseUrl -ApiToken $ApiToken -Method 'GET' -Endpoint '/v1/users'
+}
+
+function Get-OboardElementsForUser {
+  param([string]$BaseUrl,[string]$ApiToken,[string]$UserId,[int]$IntervalId)
+  $queryParams = @{ ownerIds = $UserId; intervalIds = $IntervalId }
+  Invoke-OboardAPIRequest -BaseUrl $BaseUrl -ApiToken $ApiToken -Method 'GET' -Endpoint '/v3/elements' -QueryParams $queryParams
+}
+
+function Get-OboardComments {
+  param([string]$BaseUrl,[string]$ApiToken,[string[]]$ElementIds)
+  $body = @{ elementIds = $ElementIds }
+  Invoke-OboardAPIRequest -BaseUrl $BaseUrl -ApiToken $ApiToken -Method 'POST' -Endpoint '/v3/elements/comments' -Body $body
+}
+
+function Convert-ToCommentsLookup {
+  param($Response)
+  $lookup = @{}
+  if (-not $Response) { return $lookup }
+
+  if ($Response.PSObject.Properties.Name -contains 'result') {
+    foreach ($item in $Response.result) {
+      if ($item.elementId) { $lookup[[string]$item.elementId] = @($item.comments) }
+    }
+    return $lookup
+  }
+
+  if ($Response.PSObject.Properties.Name -contains 'items') {
+    foreach ($item in $Response.items) {
+      if ($item.elementId) { $lookup[[string]$item.elementId] = @($item.comments) }
+    }
+    return $lookup
+  }
+
+  # If it's already a dictionary keyed by element id
+  foreach ($p in $Response.PSObject.Properties) {
+    $lookup[[string]$p.Name] = @($p.Value)
+  }
+  return $lookup
+}
+
+function Get-LatestComment {
+  param([object[]]$Comments)
+  if (-not $Comments -or $Comments.Count -eq 0) { return $null }
+
+  $dateProp = @('createDate','createdAt','date') |
+    Where-Object { $Comments[0].PSObject.Properties.Name -contains $_ } |
+    Select-Object -First 1
+
+  if (-not $dateProp) { return $Comments[0] }
+
+  $latest = $Comments |
+    ForEach-Object {
+      $d = $null
+      try {
+        $val = $_.$dateProp
+        if ($val -is [datetime]) { $d = $val }
+        else { $d = [datetime]::Parse($val, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal) }
+      } catch { }
+      [pscustomobject]@{ Comment = $_; When = $d }
+    } |
+    Sort-Object When -Descending |
+    Select-Object -First 1
+
+  return $latest.Comment
+}
+
+# ----------------------------
+# Hierarchy building
+# ----------------------------
+function Build-ElementHierarchy {
+  param([array]$Elements)
+
+  $byId = @{}
+  foreach ($e in $Elements) {
+    $copy = @{}
+    foreach ($p in $e.PSObject.Properties) { $copy[$p.Name] = $p.Value }
+    $copy['children'] = @()
+    $copy['_depth']   = 0
+    $byId[[string]$e.id] = $copy
+  }
+
+  $roots = @()
+  foreach ($e in $Elements) {
+    $id = [string]$e.id
+    $parentId = [string]$e.parentId   # ✅ renamed from $pid
+
+    if ($parentId -and $byId.ContainsKey($parentId)) {
+      $byId[$parentId]['children'] += $byId[$id]
+    } else {
+      $roots += $byId[$id]
+    }
+  }
+
+  function Set-Depth([hashtable]$node,[int]$depth) {
+    $node['_depth'] = $depth
+    foreach ($c in $node['children']) { Set-Depth -node $c -depth ($depth + 1) }
+  }
+  foreach ($r in $roots) { Set-Depth -node $r -depth 0 }
+
+  return [pscustomobject]@{
+    Roots = $roots
+    Index = $byId
+  }
+}
+
+
+# ----------------------------
+# Rendering helpers
+# ----------------------------
+function ConvertTo-GradeHTML {
+  param($Grade)
+  if ($null -eq $Grade -or $Grade -eq "" -or $Grade -eq "null") {
+    return "<span style='display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;font-size:12px;background:#e5e7eb;color:#6b7280;'>N/A</span>"
+  }
+  try {
+    $g = [double]$Grade
+    $pct = [math]::Round($g * 1, 0)
+
+
+    $bg = if ($g -ge 0.9) { "#dcfce7" } elseif ($g -ge 0.7) { "#bbf7d0" } elseif ($g -ge 0.5) { "#fef9c3" } elseif ($g -ge 0.3) { "#fed7aa" } else { "#fee2e2" }
+    $fg = if ($g -ge 0.9) { "#166534" } elseif ($g -ge 0.7) { "#166534" } elseif ($g -ge 0.5) { "#a16207" } elseif ($g -ge 0.3) { "#9a3412" } else { "#991b1b" }
+    return "<span style='display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;font-size:12px;background:$bg;color:$fg;'>$pct%</span>"
+  } catch {
+    return "<span style='display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;font-size:12px;background:#e5e7eb;color:#6b7280;'>N/A</span>"
+  }
+}
+
+function ConvertTo-StatusHTML {
+  param($Status)
+  if ($null -eq $Status -or $Status -eq "" -or $Status -eq "null") {
+    return "<span style='display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;font-size:12px;background:#e5e7eb;color:#6b7280;'>N/A</span>"
+  }
+  $text = "$Status"; $bg="#e5e7eb"; $fg="#6b7280"
+  switch ($Status) {
+    1 { $text="On Track";    $bg="#bbf7d0"; $fg="#166534" }
+    2 { $text="Behind";      $bg="#fef9c3"; $fg="#a16207" }
+    3 { $text="At Risk";     $bg="#fed7aa"; $fg="#9a3412" }
+    4 { $text="Not Started"; $bg="#e5e7eb"; $fg="#6b7280" }
+    5 { $text="Closed";      $bg="#dcfce7"; $fg="#166534" }
+    6 { $text="Abandoned";   $bg="#fee2e2"; $fg="#991b1b" }
+    9 { $text="Backlog";     $bg="#e5e7eb"; $fg="#6b7280" }
+  }
+  return "<span style='display:inline-block;padding:4px 10px;border-radius:4px;font-weight:600;font-size:12px;background:$bg;color:$fg;'>$text</span>"
+}
+
+function ConvertTo-DescriptionHTML {
+  param([string]$Description,[int]$MaxLength)
+  if ([string]::IsNullOrWhiteSpace($Description)) { return "<span style='color:#9ca3af;font-style:italic;'>No description</span>" }
+  $enc = Clean-OBoardText -Text $Description -MaxLength $MaxLength -ForHtml
+  if ([string]::IsNullOrWhiteSpace($enc)) { return "<span style='color:#9ca3af;font-style:italic;'>No description</span>" }
+  return "<span style='white-space:pre-wrap;'>$enc</span>"
+}
+
+function ConvertTo-CommentHTML {
+  param($Comment)
+
+  if ($null -eq $Comment) {
+    return "<span style='color:#9ca3af;font-style:italic;'>No comments</span>"
+  }
+
+  $rawText = $Comment.text
+  if (-not $rawText) { $rawText = $Comment.content }
+  if (-not $rawText) { $rawText = $Comment.comment }
+
+  $rawAuthor = $Comment.username
+  if (-not $rawAuthor) { $rawAuthor = $Comment.author }
+  if (-not $rawAuthor) { $rawAuthor = $Comment.user }
+
+  $rawDate = $Comment.createDate
+  if (-not $rawDate) { $rawDate = $Comment.createdAt }
+  if (-not $rawDate) { $rawDate = $Comment.date }
+
+  $tEnc = Clean-OBoardText -Text $rawText -MaxLength 0 -ForHtml
+  if ([string]::IsNullOrWhiteSpace($tEnc)) { return "<span style='color:#9ca3af;font-style:italic;'>No comments</span>" }
+
+  $aEnc = [System.Web.HttpUtility]::HtmlEncode([string]$rawAuthor)
+  $dEnc = [System.Web.HttpUtility]::HtmlEncode([string]$rawDate)
+
+  return @"
+<div style="white-space:pre-wrap;word-break:break-word;font-style:italic;color:#374151;line-height:1.4;">
+  $tEnc
+  <div style="margin-top:4px;font-style:normal;color:#9ca3af;font-size:11px;">$aEnc • $dEnc</div>
+</div>
+"@
+}
+
+function New-TableRowsHTML {
+  param(
+    [object[]]$Nodes,
+    [hashtable]$CommentsLookup,
+    [int]$TruncateLength,
+    [string]$UiBase
+  )
+
+  $html = ""
+
+  foreach ($node in $Nodes) {
+    $depth     = [int]$node['_depth']
+    $nodeId    = [string]$node['id']
+    $displayId = if ($node['displayId']) { [string]$node['displayId'] } else { $nodeId }
+
+    # Cleaned title + description (Fix 1 applied via helper)
+    $name = Clean-OBoardText -Text ([string]$node['name']) -ForHtml
+    $desc = ConvertTo-DescriptionHTML -Description ([string]$node['description']) -MaxLength $TruncateLength
+
+    # Deep link
+    $okrUrl  = if ($UiBase -and $nodeId) { "$UiBase$nodeId" } else { "" }
+    $safeUrl = [System.Web.HttpUtility]::HtmlAttributeEncode($okrUrl)
+
+    $isRoot     = ($depth -eq 0)
+    $titleColor = if ($isRoot) { "#16a34a" } else { "#111827" }
+
+    # Badge + title (clickable if UiBase exists)
+    $badgeInner = "<span style='display:inline-block;padding:3px 10px;border-radius:999px;background:#eef2ff;font-size:11px;font-weight:bold;color:#4338ca;font-family:Arial,Helvetica,sans-serif;'>$displayId</span>"
+    $titleInner = "<span style='font-size:13px;font-weight:700;color:$titleColor;font-family:Arial,Helvetica,sans-serif;'>$name</span>"
+
+    $badgeHtml = $badgeInner
+    $nameHtml  = "<div>$titleInner</div>"
+
+    if ($safeUrl) {
+      $badgeHtml = "<a href='$safeUrl' target='_blank' rel='noopener' style='text-decoration:none;'>$badgeInner</a>"
+      $nameHtml  = "<div><a href='$safeUrl' target='_blank' rel='noopener' style='text-decoration:none;'>$titleInner</a></div>"
+    }
+
+    # Comments: objective-only
+    $commentHtml = "<span style='color:#9ca3af;font-style:italic;'>This is a KR, see comment on the Objective level above</span>"
+    if ($isRoot) {
+      if ($CommentsLookup.ContainsKey($nodeId)) {
+        $list = @($CommentsLookup[$nodeId])
+        if ($list -and $list.Count -gt 0) {
+          $last = Get-LatestComment -Comments $list
+          $commentHtml = ConvertTo-CommentHTML -Comment $last
+        } else {
+          $commentHtml = "<span style='color:#9ca3af;font-style:italic;'>No comments</span>"
+        }
+      } else {
+        $commentHtml = "<span style='color:#9ca3af;font-style:italic;'>No comments</span>"
+      }
+    }
+
+    $statusHtml = ConvertTo-StatusHTML -Status $node['confidenceLevelId']
+    $gradeHtml  = ConvertTo-GradeHTML  -Grade  $node['grade']
+
+    # FIX 2: Outlook-safe indentation using spacer TD
+    $indentPx = 12 + ($depth * 18)
+
+    $nameBlock = @"
+<div style="margin-left:${indentPx}px;background:#ffffff;background-color:#ffffff;">
+  $nameHtml
+  <div style="margin-top:4px;font-size:12px;line-height:1.5;mso-line-height-rule:exactly;font-family:Arial,Helvetica,sans-serif;background:#ffffff;background-color:#ffffff;color:#4b5563;">
+    $desc
+  </div>
+</div>
+"@
+
+    # Row
+    $html += @"
+<tr>
+  <td style='padding:8px 4px;border-bottom:1px solid #e5e7eb;vertical-align:top;width:110px;'>$badgeHtml</td>
+  <td style='padding:8px 8px;border-bottom:1px solid #e5e7eb;vertical-align:top;'>$nameBlock</td>
+  <td style='padding:8px 6px;border-bottom:1px solid #e5e7eb;vertical-align:top;width:260px;'>$commentHtml</td>
+  <td style='padding:8px 6px;border-bottom:1px solid #e5e7eb;vertical-align:top;width:110px;'>$statusHtml</td>
+  <td style='padding:8px 6px;border-bottom:1px solid #e5e7eb;vertical-align:top;width:80px;text-align:center;'>$gradeHtml</td>
+</tr>
+"@
+
+    if ($node['children'] -and $node['children'].Count -gt 0) {
+      $html += New-TableRowsHTML -Nodes $node['children'] -CommentsLookup $CommentsLookup -TruncateLength $TruncateLength -UiBase $UiBase
+    }
+  }
+
+  return $html
+}
+
+function New-OKRReportHTML {
+  param(
+    [string]$UserEmail,
+    [int]$IntervalId,
+    [object[]]$Hierarchy,
+    [hashtable]$CommentsLookup,
+    [int]$TotalElements,
+    [int]$TruncateLength,
+    [string]$UiBase
+  )
+
+  $reportDate = Get-Date -Format "MMMM dd, yyyy"
+  $generatedTime = Get-Date -Format "HH:mm:ss"
+  $intervalName = "Interval $IntervalId"
+
+  $rows = New-TableRowsHTML -Nodes $Hierarchy -CommentsLookup $CommentsLookup -TruncateLength $TruncateLength -UiBase $UiBase
+
+  return @"
+<!DOCTYPE html>
+<html lang='en'>
+<head>
+  <meta charset='UTF-8'>
+  <title>Performance Report - $UserEmail</title>
+</head>
+<body style='margin:0;padding:0;background:#f4f4f5;font-family:Arial,Helvetica,sans-serif;'>
+
+  <table width='100%' cellpadding='0' cellspacing='0' border='0' style='background:#f4f4f5;padding:24px 0;'>
+    <tr>
+      <td align='center'>
+
+        <table width='1000' cellpadding='0' cellspacing='0' border='0'
+               style='background:#ffffff;border-radius:8px;border:1px solid #e5e7eb;overflow:hidden;width:1000px;max-width:1000px;'>
+
+          <tr>
+            <td style="padding:18px 24px;
+                 background:#4f46e5;
+                color:#ffffff;
+                font-size:18px;
+                font-weight:bold;">
+            Performance Report for
+            <a href="mailto:$UserEmail"
+                style="color:#000000 !important;
+                    text-decoration:none;
+                    font-weight:inherit;">
+                $UserEmail
+            </a>
+            </td>
+            </tr>
+
+          <tr>
+            <td style='padding:10px 24px 16px 24px;background:#4f46e5;color:#e5e7eb;font-size:12px;'>
+              $intervalName &nbsp;•&nbsp; Generated: $reportDate at $generatedTime
+            </td>
+          </tr>
+
+          <tr>
+            <td style='padding:16px 24px 16px 24px;'>
+
+              <table width='100%' cellpadding='8' cellspacing='0' border='0'
+                     style='border-collapse:collapse;font-size:12px;color:#111827;'>
+                <thead>
+                  <tr>
+                    <th align='left'   style='border-bottom:1px solid #e5e7eb;font-size:11px;font-weight:600;color:#6b7280;width:110px;padding:8px 4px;'>ID</th>
+                    <th align='left'   style='border-bottom:1px solid #e5e7eb;font-size:11px;font-weight:600;color:#6b7280;padding:8px 4px;'>OKR / Key Result</th>
+                    <th align='left'   style='border-bottom:1px solid #e5e7eb;font-size:11px;font-weight:600;color:#6b7280;width:260px;padding:8px 4px;'>Latest Comment</th>
+                    <th align='left'   style='border-bottom:1px solid #e5e7eb;font-size:11px;font-weight:600;color:#6b7280;width:110px;padding:8px 4px;'>Status</th>
+                    <th align='center' style='border-bottom:1px solid #e5e7eb;font-size:11px;font-weight:600;color:#6b7280;width:80px;padding:8px 4px;'>Grade</th>
+                  </tr>
+                </thead>
+                <tbody>
+$rows
+                </tbody>
+              </table>
+
+              <table width='100%' cellpadding='0' cellspacing='0' border='0' style='margin-top:12px;'>
+                <tr>
+                  <td style='font-size:12px;color:#4b5563;'><strong>Total Elements:</strong> $TotalElements</td>
+                  <td align='right' style='font-size:12px;color:#4b5563;'><strong>Root OKRs:</strong> $($Hierarchy.Count)</td>
+                </tr>
+              </table>
+
+            </td>
+          </tr>
+
+          <tr>
+            <td style='padding:10px 24px 16px 24px;background:#f9fafb;border-top:1px solid #e5e7eb;font-size:11px;color:#9ca3af;'>
+              This report is auto-generated. Click an ID or title to open the OKR in OBoard.
+            </td>
+          </tr>
+
+        </table>
+
+      </td>
+    </tr>
+  </table>
+
+</body>
+</html>
+"@
+}
+
+# ----------------------------
+# Graph Mail (optional)
+# ----------------------------
+function Get-GraphAccessToken {
+  param([string]$TenantId,[string]$ClientId,[string]$ClientSecret)
+  $tokenUrl = "Assign token url for your tenant"
+  $body = @{
+    client_id     = $ClientId
+    scope         = "add here link for graph scope"
+    client_secret = $ClientSecret
+    grant_type    = "client_credentials"
+  }
+  (Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded").access_token
+}
+
+function Send-GraphHtmlMail {
+  param(
+    [string]$AccessToken,
+    [string]$SenderUpn,
+    [string]$To,
+    [string]$Subject,
+    [string]$HtmlBody
+  )
+
+  $mail = @{
+    message = @{
+      subject = $Subject
+      body = @{
+        contentType = "HTML"
+        content     = $HtmlBody
+      }
+      toRecipients = @(
+        @{ emailAddress = @{ address = $To } }
+      )
+    }
+    saveToSentItems = $false
+  } | ConvertTo-Json -Depth 10
+
+  $headers = @{
+    Authorization = "Bearer $AccessToken"
+    "Content-Type"= "application/json"
+  }
+
+  Invoke-RestMethod -Method Post -Uri "enter url from your email sender application" -Headers $headers -Body $mail | Out-Null
+}
+
+# ----------------------------
+# MAIN
+# ----------------------------
+# 1) Find userId
+$users = Get-OboardUsers -BaseUrl $BaseUrl -ApiToken $ApiToken
+if (-not $users) { throw "Could not fetch users from OBoard API." }
+
+$targetUser = $users | Where-Object { $_.email -eq $UserEmail } | Select-Object -First 1
+if (-not $targetUser) { throw "User with email '$UserEmail' not found." }
+
+$userId = [string]$targetUser.accountId
+if ([string]::IsNullOrWhiteSpace($userId)) { throw "UserId/accountId missing for '$UserEmail'." }
+
+# 2) Get elements
+$elements = Get-OboardElementsForUser -BaseUrl $BaseUrl -ApiToken $ApiToken -UserId $userId -IntervalId $IntervalId
+if (-not $elements -or $elements.Count -eq 0) { throw "No elements found for '$UserEmail' in interval $IntervalId." }
+
+# 3) Build hierarchy
+$tree = Build-ElementHierarchy -Elements $elements
+$roots = $tree.Roots
+
+# 4) Fetch comments for Objectives only (roots)
+$commentsLookup = @{}
+if ($IncludeComments) {
+  $objectiveIds = @($roots | ForEach-Object { [string]$_.id }) | Where-Object { $_ } | Select-Object -Unique
+  $batchSize = 50
+  for ($i=0; $i -lt $objectiveIds.Count; $i += $batchSize) {
+    $lastIndex = [Math]::Min($i + $batchSize - 1, $objectiveIds.Count - 1)
+    $batch = $objectiveIds[$i..$lastIndex]
+    $resp = Get-OboardComments -BaseUrl $BaseUrl -ApiToken $ApiToken -ElementIds $batch
+    $partial = Convert-ToCommentsLookup -Response $resp
+    foreach ($k in $partial.Keys) { $commentsLookup[[string]$k] = @($partial[$k]) }
+  }
+}
+
+# 5) Render HTML
+$htmlOutput = New-OKRReportHTML `
+  -UserEmail $UserEmail `
+  -IntervalId $IntervalId `
+  -Hierarchy $roots `
+  -CommentsLookup $commentsLookup `
+  -TotalElements $elements.Count `
+  -TruncateLength $TruncateDescription `
+  -UiBase $UiBase
+
+# 6) If not sending email: output ONLY HTML
+<#if (-not $SendEmail) {
+  Write-Output $htmlOutput
+  return
+}
+
+
+# 7) Send email via Graph
+if ([string]::IsNullOrWhiteSpace($clientId) -or [string]::IsNullOrWhiteSpace($tenantId) -or [string]::IsNullOrWhiteSpace($clientSecret)) {
+  throw "Missing Graph credentials (ApplicationClientID/ApplicationTenantID/ApplicationClientSecret)."
+}
+
+$token = Get-GraphAccessToken -TenantId $tenantId -ClientId $clientId -ClientSecret $clientSecret
+$subject = "OKR Tasks Summary – $IntervalId | $UserEmail"
+
+Send-GraphHtmlMail -AccessToken $token -SenderUpn $senderEmail -To $Recipient -Subject $subject -HtmlBody $htmlOutput
+
+# NOTE: No Write-Output here, to avoid mixing with HTML output mode
+Write-Verbose "Email sent to $Recipient from $senderEmail"
+#>
+
+# =============================
+# SEND EMAIL (Graph) - Drop-in
+# =============================
+try {
+    # Read Automation Variables (exact names in your Azure screenshot)
+    $clientId     = Get-AutomationVariable -Name "ApplicationClientID"
+    $clientSecret = Get-AutomationVariable -Name "ApplicationClientSecret"
+    $tenantId     = Get-AutomationVariable -Name "ApplicationTenantID"
+    $senderEmail  = Get-AutomationVariable -Name "SenderEmail"
+
+    # Optional default recipient variable you have
+    $defaultRecipient = ""
+    try { $defaultRecipient = Get-AutomationVariable -Name "myemail" } catch { }
+
+    # Recipient selection: param > myemail var > UserEmail
+    $recipient =
+        if (-not [string]::IsNullOrWhiteSpace($Recipient)) { $Recipient }
+        elseif (-not [string]::IsNullOrWhiteSpace($defaultRecipient)) { $defaultRecipient }
+        else { $UserEmail }
+
+    # Validate
+    if ([string]::IsNullOrWhiteSpace($tenantId))     { throw "Automation Variable missing/empty: ApplicationTenantID" }
+    if ([string]::IsNullOrWhiteSpace($clientId))     { throw "Automation Variable missing/empty: ApplicationClientID" }
+    if ([string]::IsNullOrWhiteSpace($clientSecret)) { throw "Automation Variable missing/empty: ApplicationClientSecret" }
+    if ([string]::IsNullOrWhiteSpace($senderEmail))  { throw "Automation Variable missing/empty: SenderEmail" }
+    if ([string]::IsNullOrWhiteSpace($htmlOutput))   { throw "htmlOutput is empty (report generation failed earlier)." }
+
+    # Get Graph token
+    $tokenUrl = "Assign token url for your tenant"
+    $tokenBody = @{
+        client_id     = $clientId
+        scope         = "add here link for graph scope"
+        client_secret = $clientSecret
+        grant_type    = "client_credentials"
+    }
+    $tokenResponse = Invoke-RestMethod -Method Post -Uri $tokenUrl -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+    $accessToken = $tokenResponse.access_token
+    if ([string]::IsNullOrWhiteSpace($accessToken)) { throw "Failed to obtain Graph access token." }
+
+    # Send mail
+    $mailSubject = "OKR Tasks Summary – Interval $IntervalId | $UserEmail"
+
+    $mailJson = @{
+        message = @{
+            subject = $mailSubject
+            body = @{
+                contentType = "HTML"
+                content     = $htmlOutput
+            }
+            toRecipients = @(
+                @{ emailAddress = @{ address = $recipient } }
+            )
+        }
+        saveToSentItems = $false
+    } | ConvertTo-Json -Depth 10
+
+    $graphHeaders = @{
+        "Authorization" = "Bearer $accessToken"
+        "Content-Type"  = "application/json"
+    }
+
+    Invoke-RestMethod -Method Post `
+      -Uri "add her3e url of email sender application from your idp" `
+      -Headers $graphHeaders -Body $mailJson
+
+    Write-Output "📧 Email sent successfully to $recipient from $senderEmail"
+}
+catch {
+    Write-Output "❌ Email send failed: $($_.Exception.Message)"
+    throw
+}
