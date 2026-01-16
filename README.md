@@ -64,3 +64,7 @@ Output report from the azure runbook :
 
 
 Note: Email clients (e.g. Microsoft Outlook, Gmail) may render HTML and CSS differently. As a result, the layout, spacing, or styling of the report may vary depending on the viewer’s application and version.
+
+✨ Security Note:
+This script intentionally contains no hard-coded credentials, secrets, tenant information, or internal identifiers. All authentication values (API tokens, client IDs, secrets, senders, etc.) are expected to be provided through secure configuration channels such as Azure Automation Variables, Key Vault, or equivalent secret storage systems. All credentials must be provided through secure secret storage. Follow your organization’s security practices when configuring and using this script.
+
