@@ -1,4 +1,4 @@
-Performance-Report-Generator
+Oboard Performance-Report-Generator
 
 This project is provided as-is for internal tooling and automation workflows.
 
