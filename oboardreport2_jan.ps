@@ -1,38 +1,45 @@
 <#
 .SYNOPSIS
     Generate HTML email report for user OKRs with hierarchy
+
 .DESCRIPTION
-    Fetches OKRs for a specific user and interval, builds hierarchy, and generates HTML table
-    Outputs only HTML suitable for piping to email scripts
-    Reads configuration from config.json
+    Fetches OKRs for a specific user and interval, builds hierarchy, and generates an HTML table.
+    Outputs only HTML suitable for piping to email scripts.
+    Reads configuration from config.json.
+
 .PARAMETER UserEmail
-    User's email address
+    User's email address.
+
 .PARAMETER IntervalId
-    Interval ID to filter OKRs
+    Interval ID to filter OKRs.
+
 .PARAMETER ConfigFile
-    Path to config.json file 
+    Path to config.json file.
+
 .PARAMETER TruncateDescription
-    Maximum characters for description (0 = no truncation, default from config)
+    Maximum characters for description (0 = no truncation, default from config).
+
 .PARAMETER IncludeComments
-    Include last comment information
+    Include last comment information.
+
 .EXAMPLE
     .\Export-OKREmailReport.ps1 -UserEmail "john@example.com" -IntervalId 123
+
 .EXAMPLE
     .\Export-OKREmailReport.ps1 -UserEmail "john@example.com" -IntervalId 123 -IncludeComments | Out-File report.html
-	
-This script is safe to publish and does not contain or expose any sensitive data.
 
-No secrets, API keys, tokens, passwords, or email addresses are embedded in this repository.
-
-Authentication values are referenced at runtime and are not stored in the code.
-
-Relative endpoint paths (e.g. '/v3/elements', '/v1/users') are used as internal route definitions only. They do not contain hostnames, domains, or real URLs and convey no public attack surface.
-
-These paths follow common REST patterns such as:
-/v1/users
-/v2/projects
-/v3/comments
-and can be adjusted based on your own API structure, OBoard configuration, or integration requirements.
+.NOTES
+    Security:
+    - This script is safe to publish and does not contain or expose any sensitive data.
+    - No secrets, API keys, tokens, passwords, or real email addresses are embedded in this script.
+    - Authentication values are referenced at runtime (e.g. Automation variables) and are not stored in the code.
+    - Relative endpoint paths (e.g. '/v3/elements', '/v1/users') are used as internal route definitions only.
+      They do not contain hostnames, domains, or real URLs and do not introduce a public attack surface.
+    - These paths follow common REST patterns such as:
+        /v1/users
+        /v2/projects
+        /v3/comments
+      and can be adjusted based on your own API structure, OBoard configuration, or integration requirements.
 #>
 
 
@@ -932,5 +939,6 @@ catch {
     Write-Error $_.Exception.Message -ErrorAction Stop
     exit 1
 }
+
 
 #endregion
